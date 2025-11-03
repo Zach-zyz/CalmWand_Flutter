@@ -281,7 +281,7 @@ class _SessionSummaryScreenState extends State<SessionSummaryScreen> {
     SessionProvider sessionProvider,
     BluetoothService bluetoothService,
     SettingsProvider settings,
-  ) {
+  ) async {
     HapticFeedback.mediumImpact();
 
     if (currentSession.isSessionActive) {
@@ -324,7 +324,16 @@ class _SessionSummaryScreenState extends State<SessionSummaryScreen> {
       }
     } else {
       // Start session
-      bluetoothService.startArduinoSession();
+      await bluetoothService.startArduinoSession();
+
+      // Sync SessionID from BluetoothService to CurrentSessionProvider
+      final receivedSessionId = bluetoothService.sessionId;
+      if (receivedSessionId != null) {
+        currentSession.sessionId = receivedSessionId;
+        print('✅ Session started with ID: $receivedSessionId');
+      } else {
+        print('⚠️ Warning: SessionID not received from Arduino');
+      }
 
       currentSession.startSession(
         recordingInterval: settings.interval,
@@ -333,6 +342,9 @@ class _SessionSummaryScreenState extends State<SessionSummaryScreen> {
           final tempData = bluetoothService.temperatureData;
           final temp = (double.tryParse(tempData) ?? 0) / 100;
           currentSession.addTemperatureReading(temp);
+
+          // Print temperature reading to terminal
+          print('📊 Reading: ${temp.toStringAsFixed(2)}°F');
         },
       );
 

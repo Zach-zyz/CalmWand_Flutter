@@ -69,6 +69,7 @@ class BluetoothService extends ChangeNotifier {
 
   // Subscriptions
   StreamSubscription? _scanSubscription;
+  StreamSubscription? _connectionStateSubscription;
   final List<StreamSubscription> _characteristicSubscriptions = [];
 
   BluetoothService() {
@@ -81,8 +82,14 @@ class BluetoothService extends ChangeNotifier {
       _adapterState = state;
 
       if (state == fbp.BluetoothAdapterState.on) {
-        _statusMessage = 'Bluetooth is ready. Tap to scan.';
-        // Don't auto-scan here, let user initiate scan
+        // On Web platform, scan must be triggered by user action (button click)
+        // On mobile platforms, auto-scan when Bluetooth is ready (matches Swift behavior)
+        if (kIsWeb) {
+          _statusMessage = 'Bluetooth is ready. Tap to scan.';
+        } else {
+          _statusMessage = 'Scanning for Devices...';
+          startScan();
+        }
       } else if (state == fbp.BluetoothAdapterState.off) {
         _statusMessage = 'Bluetooth is OFF. Please turn it on.';
         _isScanning = false;
@@ -107,7 +114,9 @@ class BluetoothService extends ChangeNotifier {
       _adapterState = state;
 
       if (state == fbp.BluetoothAdapterState.on) {
-        _statusMessage = 'Bluetooth is ready. Tap to scan.';
+        _statusMessage = 'Scanning for Devices...';
+        // Auto-scan if Bluetooth is already on (matches Swift behavior)
+        startScan();
       } else {
         _statusMessage = 'Bluetooth NOT OPEN or UNAVAILABLE';
       }
@@ -143,14 +152,7 @@ class BluetoothService extends ChangeNotifier {
 
       print('Starting BLE scan with service UUID: ${BluetoothConstants.serviceUUID}');
 
-      // Start scanning with service filter (matches Swift's scanForPeripherals)
-      // Remove timeout to scan continuously like Swift version
-      await fbp.FlutterBluePlus.startScan(
-        withServices: [fbp.Guid(BluetoothConstants.serviceUUID)],
-        // Remove timeout parameter for continuous scanning
-      );
-
-      // Listen for scan results
+      // Listen for scan results BEFORE starting scan (critical for Web platform)
       _scanSubscription?.cancel();
       _scanSubscription = fbp.FlutterBluePlus.scanResults.listen((results) {
         for (fbp.ScanResult result in results) {
@@ -168,12 +170,20 @@ class BluetoothService extends ChangeNotifier {
         notifyListeners();
       });
 
-      // Auto-stop scan after 30 seconds to save battery
-      Future.delayed(const Duration(seconds: 30), () {
-        if (_isScanning) {
-          stopScan();
-        }
-      });
+      // Start scanning with service filter (matches Swift's scanForPeripherals)
+      // Set 5 second timeout for Web platform compatibility
+      await fbp.FlutterBluePlus.startScan(
+        withServices: [fbp.Guid(BluetoothConstants.serviceUUID)],
+        timeout: const Duration(seconds: 5),
+      );
+
+      // Wait for scan to complete and update status
+      await fbp.FlutterBluePlus.isScanning.firstWhere((scanning) => scanning == false);
+      _isScanning = false;
+      _statusMessage = _devices.isEmpty
+          ? 'No devices found. Tap to scan again.'
+          : 'Found ${_devices.length} device(s)';
+      notifyListeners();
     } catch (e) {
       print('Error starting scan: $e');
       _statusMessage = 'Error starting scan: $e';
@@ -190,7 +200,8 @@ class BluetoothService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Connect to a device (similar to Swift's connect method)
+  /// Connect to a device (matches Swift's connect method)
+  /// Simplified sequential flow: connect -> listen -> discover
   Future<void> connect(fbp.BluetoothDevice device) async {
     _isConnecting = true;
     _statusMessage = 'Connecting...';
@@ -200,18 +211,12 @@ class BluetoothService extends ChangeNotifier {
       // Stop scanning to save battery (matches Swift's stopScan)
       await stopScan();
 
-      // Listen for connection state changes
-      device.connectionState.listen((state) {
-        if (state == fbp.BluetoothConnectionState.disconnected) {
-          print('Device disconnected: ${device.platformName}');
-          _handleDisconnection();
-        }
-      });
+      // Cancel previous connection state subscription if any
+      await _connectionStateSubscription?.cancel();
 
-      // Connect with autoConnect for background reconnection
+      // Connect to device with 15 second timeout (reasonable for BLE)
       await device.connect(
         timeout: const Duration(seconds: 15),
-        autoConnect: true, // Similar to Swift's state restoration
       );
 
       _connectedDevice = device;
@@ -221,10 +226,18 @@ class BluetoothService extends ChangeNotifier {
       print('Successfully connected to ${device.platformName}');
       notifyListeners();
 
-      // Discover services (matches Swift's discoverServices)
+      // Set up disconnection listener AFTER successful connection
+      _connectionStateSubscription = device.connectionState.listen((state) {
+        if (state == fbp.BluetoothConnectionState.disconnected) {
+          print('Device disconnected: ${device.platformName}');
+          _handleDisconnection();
+        }
+      });
+
+      // Discover services and characteristics (matches Swift's discoverServices)
       await _discoverServices(device);
     } catch (e) {
-      print('Connection failed: $e');
+      print('❌ Connection failed: $e');
       _statusMessage = 'Connection failed: $e';
       _isConnecting = false;
       _isConnected = false;
@@ -239,11 +252,18 @@ class BluetoothService extends ChangeNotifier {
     _statusMessage = 'Disconnected';
     notifyListeners();
 
-    // Auto-restart scan like Swift version does
-    print('Restarting scan after disconnection...');
-    Future.delayed(const Duration(milliseconds: 500), () {
-      startScan();
-    });
+    // Auto-restart scan on mobile platforms only
+    // On Web, user must manually initiate scan (Web Bluetooth requirement)
+    if (!kIsWeb) {
+      print('Restarting scan after disconnection...');
+      Future.delayed(const Duration(milliseconds: 500), () {
+        startScan();
+      });
+    } else {
+      print('Device disconnected. Tap to scan again.');
+      _statusMessage = 'Disconnected. Tap to scan again.';
+      notifyListeners();
+    }
   }
 
   /// Discover services and characteristics (matches Swift's didDiscoverServices)
@@ -278,126 +298,172 @@ class BluetoothService extends ChangeNotifier {
   }
 
   /// Set up all characteristics (matches Swift's didDiscoverCharacteristics)
+  /// IMPORTANT: First discover all characteristics, THEN set up notifications/reads
   Future<void> _setupCharacteristics(fbp.BluetoothService service) async {
     print('Setting up characteristics for service ${service.uuid}');
     print('Found ${service.characteristics.length} characteristics');
 
+    // PHASE 1: Discover and store all characteristic references
     for (fbp.BluetoothCharacteristic char in service.characteristics) {
       final uuidStr = char.uuid.toString().toUpperCase();
       print('Characteristic: $uuidStr');
 
-      // Temperature (NOTIFY)
       if (uuidStr == BluetoothConstants.temperatureCharacteristicUUID.toUpperCase()) {
         _temperatureChar = char;
         print('✓ Found Temperature characteristic (NOTIFY)');
-        await _subscribeToCharacteristic(char, _handleTemperatureUpdate);
       }
-      // Brightness (READ/WRITE)
       else if (uuidStr == BluetoothConstants.brightnessCharacteristicUUID.toUpperCase()) {
         _brightnessChar = char;
         print('✓ Found Brightness characteristic (READ/WRITE)');
-        await _readCharacteristic(char, (value) {
-          _brightnessData = value;
-          notifyListeners();
-        });
       }
-      // Inhale Time (READ/WRITE)
       else if (uuidStr == BluetoothConstants.inhaleTimeCharacteristicUUID.toUpperCase()) {
         _inhaleTimeChar = char;
         print('✓ Found Inhale Time characteristic (READ/WRITE)');
-        await _readCharacteristic(char, (value) {
-          _inhaleData = value;
-          notifyListeners();
-        });
       }
-      // Exhale Time (READ/WRITE)
       else if (uuidStr == BluetoothConstants.exhaleTimeCharacteristicUUID.toUpperCase()) {
         _exhaleTimeChar = char;
         print('✓ Found Exhale Time characteristic (READ/WRITE)');
-        await _readCharacteristic(char, (value) {
-          _exhaleData = value;
-          notifyListeners();
-        });
       }
-      // Motor Strength (READ/WRITE)
       else if (uuidStr == BluetoothConstants.motorStrengthCharacteristicUUID.toUpperCase()) {
         _motorStrengthChar = char;
         print('✓ Found Motor Strength characteristic (READ/WRITE)');
-        await _readCharacteristic(char, (value) {
-          _motorStrengthData = value;
-          notifyListeners();
-        });
       }
-      // File List Request (WRITE)
       else if (uuidStr == BluetoothConstants.fileListRequestCharacteristicUUID.toUpperCase()) {
         _fileListRequestChar = char;
         print('✓ Found File List Request characteristic (WRITE)');
       }
-      // File Name (NOTIFY)
       else if (uuidStr == BluetoothConstants.fileNameCharacteristicUUID.toUpperCase()) {
         _fileNameChar = char;
         print('✓ Found File Name characteristic (NOTIFY)');
-        await _subscribeToCharacteristic(char, _handleFileNameUpdate);
       }
-      // File Content Request (WRITE)
       else if (uuidStr == BluetoothConstants.fileContentRequestCharacteristicUUID.toUpperCase()) {
         _fileContentRequestChar = char;
         print('✓ Found File Content Request characteristic (WRITE)');
       }
-      // File Content (NOTIFY)
       else if (uuidStr == BluetoothConstants.fileContentCharacteristicUUID.toUpperCase()) {
         _fileContentChar = char;
-        print('✓ Found File Content characteristic (NOTIFY). Subscribing…');
-        await _subscribeToCharacteristic(char, _handleFileContentUpdate);
+        print('✓ Found File Content characteristic (NOTIFY)');
       }
-      // File Action (WRITE)
       else if (uuidStr == BluetoothConstants.fileActionCharacteristicUUID.toUpperCase()) {
         _fileActionChar = char;
         print('✓ Found File Action characteristic (WRITE)');
       }
-      // Session ID (NOTIFY)
       else if (uuidStr == BluetoothConstants.sessionIdCharacteristicUUID.toUpperCase()) {
         _sessionIdChar = char;
         print('✓ Found Session ID characteristic (NOTIFY)');
-        await _subscribeToCharacteristic(char, _handleSessionIdUpdate);
       }
     }
 
-    print('Characteristic setup completed');
+    print('All characteristics discovered. Setting up notifications (background)...');
+
+    // PHASE 2: Set up notifications for NOTIFY characteristics (ASYNC - non-blocking)
+    // These run in the background and don't block READ operations
+    if (_temperatureChar != null) {
+      _subscribeToCharacteristic(_temperatureChar!, _handleTemperatureUpdate);
+    }
+
+    if (_fileNameChar != null) {
+      _subscribeToCharacteristic(_fileNameChar!, _handleFileNameUpdate);
+    }
+
+    if (_fileContentChar != null) {
+      _subscribeToCharacteristic(_fileContentChar!, _handleFileContentUpdate);
+    }
+
+    if (_sessionIdChar != null) {
+      _subscribeToCharacteristic(_sessionIdChar!, _handleSessionIdUpdate);
+    }
+
+    print('NOTIFY setup started (running in background). Reading initial values...');
+
+    // PHASE 3: Read initial values for READ/WRITE characteristics (SEQUENTIAL)
+    if (_brightnessChar != null) {
+      await _readCharacteristic(_brightnessChar!, (value) {
+        _brightnessData = value;
+        notifyListeners();
+      });
+    }
+
+    if (_inhaleTimeChar != null) {
+      await _readCharacteristic(_inhaleTimeChar!, (value) {
+        _inhaleData = value;
+        notifyListeners();
+      });
+    }
+
+    if (_exhaleTimeChar != null) {
+      await _readCharacteristic(_exhaleTimeChar!, (value) {
+        _exhaleData = value;
+        notifyListeners();
+      });
+    }
+
+    if (_motorStrengthChar != null) {
+      await _readCharacteristic(_motorStrengthChar!, (value) {
+        _motorStrengthData = value;
+        notifyListeners();
+      });
+    }
+
+    print('✅ Characteristic setup completed - device ready to use!');
   }
 
   /// Subscribe to characteristic notifications
+  /// Fire-and-forget approach: set listener first, enable notification without waiting
   Future<void> _subscribeToCharacteristic(
     fbp.BluetoothCharacteristic char,
     Function(String) handler,
   ) async {
-    try {
-      await char.setNotifyValue(true);
-      final subscription = char.lastValueStream.listen((value) {
+    // STEP 1: Set up the listener FIRST (before enabling notifications)
+    // Use onValueReceived (not lastValueStream) for NOTIFY-only characteristics
+    final subscription = char.onValueReceived.listen(
+      (value) {
         if (value.isNotEmpty) {
           final strValue = utf8.decode(value);
           handler(strValue);
         }
-      });
-      _characteristicSubscriptions.add(subscription);
-    } catch (e) {
-      print('Error subscribing to ${char.uuid}: $e');
+      },
+      onError: (error) {
+        print('⚠️ Error in ${char.uuid} stream: $error');
+      },
+    );
+
+    // Auto-cancel subscription when device disconnects (prevents memory leaks)
+    if (_connectedDevice != null) {
+      _connectedDevice!.cancelWhenDisconnected(subscription);
     }
+    _characteristicSubscriptions.add(subscription);
+
+    // STEP 2: Enable notifications but DON'T WAIT (fire and forget)
+    // This avoids waiting for Arduino's descriptor write confirmation
+    char.setNotifyValue(true).then((_) {
+      print('✓ Notification enabled for ${char.uuid}');
+    }).catchError((e) {
+      print('⚠️ setNotifyValue warning for ${char.uuid}: $e (non-fatal, listener already active)');
+    });
+
+    print('✅ Listener set up for ${char.uuid}');
   }
 
-  /// Read characteristic value
+  /// Read characteristic value with detailed logging
   Future<void> _readCharacteristic(
     fbp.BluetoothCharacteristic char,
     Function(String) handler,
   ) async {
     try {
+      print('→ Reading ${char.uuid}...');
       final value = await char.read();
+
       if (value.isNotEmpty) {
         final strValue = utf8.decode(value);
+        print('✓ Read ${char.uuid}: "$strValue"');
         handler(strValue);
+      } else {
+        print('⚠️ Read ${char.uuid}: empty value');
       }
     } catch (e) {
-      print('Error reading ${char.uuid}: $e');
+      print('❌ Error reading ${char.uuid}: $e');
+      // Don't rethrow - allow setup to continue
     }
   }
 
@@ -406,11 +472,19 @@ class BluetoothService extends ChangeNotifier {
   void _handleTemperatureUpdate(String value) {
     _temperatureData = value;
     notifyListeners();
+    // Temperature updates are continuous - logging would be too noisy
   }
 
   void _handleFileNameUpdate(String value) {
     if (value != BluetoothConstants.markerEnd) {
-      _arduinoFileList.add(value);
+      // Arduino sends format: "sid:filename:mins" (e.g., "0:data0.txt:5")
+      // We extract just the filename for compatibility
+      final parts = value.split(':');
+      if (parts.length >= 2) {
+        _arduinoFileList.add(parts[1]); // Extract filename (e.g., "data0.txt")
+      } else {
+        _arduinoFileList.add(value); // Fallback to original value
+      }
       notifyListeners();
     }
     // "END" means Arduino is done sending filenames
@@ -429,11 +503,15 @@ class BluetoothService extends ChangeNotifier {
   }
 
   void _handleSessionIdUpdate(String value) {
+    print('📥 Received SessionID notification: "$value"');
     final trimmed = value.trim();
     final id = int.tryParse(trimmed);
     if (id != null) {
+      print('✅ Parsed SessionID: $id');
       _sessionId = id;
       notifyListeners();
+    } else {
+      print('❌ Failed to parse SessionID from: "$value"');
     }
   }
 
@@ -442,21 +520,33 @@ class BluetoothService extends ChangeNotifier {
   /// Write brightness value (0-255)
   Future<void> writeBrightness(String brightness) async {
     await _writeCharacteristic(_brightnessChar, brightness, 'brightness');
+    // Update local value immediately (matches Swift behavior - no NOTIFY subscription)
+    _brightnessData = brightness;
+    notifyListeners();
   }
 
   /// Write inhale time in milliseconds
   Future<void> writeInhaleTime(String inhaleTime) async {
     await _writeCharacteristic(_inhaleTimeChar, inhaleTime, 'inhale time');
+    // Update local value immediately (matches Swift behavior - no NOTIFY subscription)
+    _inhaleData = inhaleTime;
+    notifyListeners();
   }
 
   /// Write exhale time in milliseconds
   Future<void> writeExhaleTime(String exhaleTime) async {
     await _writeCharacteristic(_exhaleTimeChar, exhaleTime, 'exhale time');
+    // Update local value immediately (matches Swift behavior - no NOTIFY subscription)
+    _exhaleData = exhaleTime;
+    notifyListeners();
   }
 
   /// Write motor strength (0-255)
   Future<void> writeMotorStrength(String strength) async {
     await _writeCharacteristic(_motorStrengthChar, strength, 'motor strength');
+    // Update local value immediately (matches Swift behavior - no NOTIFY subscription)
+    _motorStrengthData = strength;
+    notifyListeners();
   }
 
   /// Generic write to characteristic
@@ -545,6 +635,7 @@ class BluetoothService extends ChangeNotifier {
   }
 
   /// Delete session file on Arduino
+  /// IMPORTANT: Uses fileActionChar (matches Swift's deleteArduinoSession)
   Future<void> deleteArduinoSession(String filename) async {
     if (_fileActionChar == null || _connectedDevice == null) {
       print('❌ Cannot delete: missing characteristic or peripheral');
@@ -587,7 +678,24 @@ class BluetoothService extends ChangeNotifier {
     try {
       final data = utf8.encode(BluetoothConstants.cmdStart);
       await _fileActionChar!.write(data, withoutResponse: false);
-      print('→ Writing "START" to Arduino…');
+      print('→ Sent "START" to Arduino');
+
+      // Poll for SessionID with timeout (Arduino may take 200-300ms to respond)
+      print('⏳ Waiting for SessionID...');
+      const maxWaitMs = 1000;
+      const checkIntervalMs = 50;
+      int elapsedMs = 0;
+
+      while (_sessionId == null && elapsedMs < maxWaitMs) {
+        await Future.delayed(const Duration(milliseconds: checkIntervalMs));
+        elapsedMs += checkIntervalMs;
+      }
+
+      if (_sessionId != null) {
+        print('✅ SessionID received: $_sessionId (after ${elapsedMs}ms)');
+      } else {
+        print('❌ SessionID not received after ${maxWaitMs}ms timeout');
+      }
     } catch (e) {
       print('Error starting session: $e');
     }
@@ -603,6 +711,11 @@ class BluetoothService extends ChangeNotifier {
 
   /// Clean up connections and subscriptions
   Future<void> _cleanup() async {
+    // Cancel connection state subscription
+    await _connectionStateSubscription?.cancel();
+    _connectionStateSubscription = null;
+
+    // Cancel characteristic subscriptions
     for (var subscription in _characteristicSubscriptions) {
       await subscription.cancel();
     }
